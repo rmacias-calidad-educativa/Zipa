@@ -109,40 +109,98 @@ def load_book(path: str):
     df0.columns = [c.strip() for c in df0.columns]
     df1.columns = [c.strip() for c in df1.columns]
 
-    # Validaciones mínimas (opcionales)
-    # req0 = {"Sede", "grado"}; req1 = {"Sede", "Grado", "area", "puntajenacional", "puntajePlantel"}
-
+    # convertir tipos
     df0["grado"] = pd.to_numeric(df0["grado"], errors="coerce")
     df1["Grado"] = pd.to_numeric(df1["Grado"], errors="coerce")
     for c in ["puntajenacional", "puntajePlantel"]:
         df1[c] = pd.to_numeric(df1[c], errors="coerce")
+
+    # diff = Plantel - Nacional
     df1["diff"] = df1["puntajePlantel"] - df1["puntajenacional"]
 
+    # long format para promedios por grado/área
     dl0 = (
         df0.melt(
             id_vars=["Sede", "grado"],
-            value_vars=[c for c in df0.columns if c not in {"Source.Name","Sede","grado","lista","nombre","definitiva"}],
+            value_vars=[
+                c for c in df0.columns
+                if c not in {"Source.Name", "Sede", "grado", "lista", "nombre", "definitiva"}
+            ],
             var_name="prueba",
             value_name="puntaje",
-        ).dropna(subset=["puntaje"])
+        )
+        .dropna(subset=["puntaje"])
     )
 
-    dims = [d for d in ["competencia", "componente", "estandar", "evidencia", "tarea"] if d in df1.columns]
+    # dimensiones disponibles
+    dims = [
+        d for d in ["competencia", "componente", "estandar", "evidencia", "tarea"]
+        if d in df1.columns
+    ]
     return df0, df1, dl0, dims
 
-def fortalezas_retos(df1, group_keys, dim, modo, umbral=None, topn=None, pre_umbral=None):
-    agg = df1.groupby(group_keys + [dim], as_index=False).agg(diff_mean=("diff", "mean"))
+# --- FUNCIÓN CORREGIDA: Fortalezas / Retos ---
+def fortalezas_retos(df1, group_keys, dim, modo, umbral=None, topn=None):
+    """
+    Clasificación según la regla:
+      - diff_mean > 0  → Fortaleza (↑)  (Plantel por encima del nacional)
+      - diff_mean < 0  → Reto (↓)       (Plantel por debajo del nacional)
+      - diff_mean = 0  → En línea (≈)   (opcional mostrar/ocultar)
+
+    Modo "Umbral": filtra por |diff_mean| >= umbral.
+    Modo "Top/Bottom N": muestra las N mayores fortalezas y los N mayores retos,
+    evitando duplicados.
+    """
+    agg = df1.groupby(group_keys + [dim], as_index=False).agg(
+        diff_mean=("diff", "mean")
+    )
+
     cols = group_keys + [dim, "diff_mean"]
+
     if agg.empty:
         return agg.assign(tipo=pd.Series(dtype=object))[cols + ["tipo"]]
+
+    # Clasificación por signo
+    agg["tipo"] = np.select(
+        [
+            agg["diff_mean"] > 0,
+            agg["diff_mean"] < 0,
+        ],
+        [
+            "Fortaleza (↑)",
+            "Reto (↓)",  # o "Debilidad (↓)" si prefieres ese texto
+        ],
+        default="En línea (≈)",
+    )
+
     if modo == "Umbral":
-        sub = agg[np.abs(agg["diff_mean"]) >= float(umbral or 3.0)].copy()
-        sub["tipo"] = np.where(sub["diff_mean"] >= 0, "Fortaleza (↑)", "Reto (↓)")
+        # Filtramos por magnitud de la diferencia
+        thr = float(umbral or 0.0)
+        sub = agg[np.abs(agg["diff_mean"]) >= thr].copy()
+        # Quitamos los que están exactamente en línea si no te interesa verlos
+        sub = sub[sub["tipo"] != "En línea (≈)"]
         return sub[cols + ["tipo"]]
+
+    # --- Modo Top/Bottom N ---
     topn = topn or 10
-    top = agg.nlargest(topn, "diff_mean").assign(tipo="Fortaleza (↑)")
-    bot = agg.nsmallest(topn, "diff_mean").assign(tipo="Reto (↓)")
-    return pd.concat([top, bot], ignore_index=True)[cols + ["tipo"]]
+
+    # Solo fortalezas (>0) -> N mayores
+    fortalezas = (
+        agg[agg["diff_mean"] > 0]
+        .nlargest(topn, "diff_mean")
+        .copy()
+    )
+
+    # Solo retos (<0) -> N menores
+    retos = (
+        agg[agg["diff_mean"] < 0]
+        .nsmallest(topn, "diff_mean")
+        .copy()
+    )
+
+    res = pd.concat([fortalezas, retos], ignore_index=True)
+
+    return res[cols + ["tipo"]]
 
 # --- Cargar datos ---
 try:
@@ -168,9 +226,15 @@ dl0 = dl0[dl0["Sede"] == TARGET_SEDE_DATASET].copy()
 df1 = df1[df1["Sede"] == TARGET_SEDE_DATASET].copy()
 
 # --- Listas de áreas y grados disponibles (en Zipa) ---
-areas_all = sorted(set(dl0["prueba"].dropna().unique()).union(set(df1["area"].dropna().unique())))
+areas_all = sorted(
+    set(dl0["prueba"].dropna().unique()).union(set(df1["area"].dropna().unique()))
+)
 GRADOS_VALIDOS = {3, 5, 7, 9}
-grados_disp = sorted(GRADOS_VALIDOS.intersection(set(pd.to_numeric(dl0["grado"], errors="coerce").dropna().astype(int))))
+grados_disp = sorted(
+    GRADOS_VALIDOS.intersection(
+        set(pd.to_numeric(dl0["grado"], errors="coerce").dropna().astype(int))
+    )
+)
 
 # --- Sidebar ---
 with st.sidebar:
@@ -186,8 +250,10 @@ with st.sidebar:
     st.divider()
     st.markdown("### Filtros")
     # Áreas
-    areas_sel = st.multiselect("Áreas (vacío = todas)", options=areas_all, default=[])
-    # Grado (nuevo)
+    areas_sel = st.multiselect(
+        "Áreas (vacío = todas)", options=areas_all, default=[]
+    )
+    # Grado
     if grados_disp:
         grado_opt = st.radio(
             "Grado",
@@ -206,8 +272,12 @@ df1_f = df1 if not areas_sel else df1[df1["area"].isin(areas_sel)]
 # Aplicar filtro de grado (si corresponde)
 if grado_opt != "Todos":
     gsel = int(grado_opt)
-    dl0_f = dl0_f[pd.to_numeric(dl0_f["grado"], errors="coerce").astype("Int64") == gsel]
-    df1_f = df1_f[pd.to_numeric(df1_f["Grado"], errors="coerce").astype("Int64") == gsel]
+    dl0_f = dl0_f[
+        pd.to_numeric(dl0_f["grado"], errors="coerce").astype("Int64") == gsel
+    ]
+    df1_f = df1_f[
+        pd.to_numeric(df1_f["Grado"], errors="coerce").astype("Int64") == gsel
+    ]
     filtro_grado_txt = f" · Grado {gsel}"
 else:
     filtro_grado_txt = " · Todos los grados"
@@ -225,6 +295,7 @@ with c1:
     )
     st.subheader("Promedio por grado")
     st.altair_chart(bar_chart(g_grado, "promedio", "grado"), use_container_width=True)
+
 with c2:
     g_area = (
         dl0_f.groupby("prueba", as_index=False)
@@ -234,9 +305,11 @@ with c2:
     st.subheader("Promedio por área")
     st.altair_chart(bar_chart(g_area, "promedio", "prueba"), use_container_width=True)
 
-# Fortalezas / Retos
+# Fortalezas / Retos por dimensión
 for dim in dims:
-    with st.expander(f"{TARGET_SEDE_CANON}{filtro_grado_txt} · {dim} (Fortalezas/Retos)"):
+    with st.expander(
+        f"{TARGET_SEDE_CANON}{filtro_grado_txt} · {dim} (Fortalezas/Retos)"
+    ):
         tb = fortalezas_retos(df1_f, [], dim, modo, umbral, topn)
         if tb.empty:
             st.info("Sin resultados con el criterio actual.")
